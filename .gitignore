@@ -1,0 +1,11 @@
+# secrets
+.env
+.env.*
+# deps / build
+node_modules/
+dist/
+# smoke-test artifacts
+artifacts/
+*.png
+.sandbox-id
+*.log
