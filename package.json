@@ -21,7 +21,7 @@
     "test": "vitest run",
     "smoke": "tsx smoke/phase1.ts",
     "e2e": "tsx examples/workspace-e2e.ts",
-    "example:agent": "tsx examples/agent.ts"
+    "example:agent": "tsx --env-file-if-exists=.env examples/agent.ts"
   },
   "dependencies": {
     "@superserve/sdk": "0.11.4"

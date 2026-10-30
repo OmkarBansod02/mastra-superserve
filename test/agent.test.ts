@@ -13,7 +13,7 @@ vi.mock('@superserve/sdk', async (importOriginal) => {
   return { ...actual, Sandbox: sdk };
 });
 
-const { createDesktopAgent, createDesktopWorkspace } = await import('../examples/desktop-agent.js');
+const { createDesktopAgent, createDesktopWorkspace, shellWritesTo } = await import('../examples/desktop-agent.js');
 const { scriptedModel } = await import('../examples/scripted-model.js');
 
 let vm: FakeVm;
@@ -73,4 +73,24 @@ describe('Mastra Agent → workspace computer tools → SuperserveSandbox', () =
     expect(vm.desktop.click).not.toHaveBeenCalled();
     expect(sdk.create).not.toHaveBeenCalled();
   });
+});
+
+describe('shellWritesTo (demo check that a file was not created through the shell)', () => {
+  const path = '/tmp/mastra-agent-demo.txt';
+
+  it.each([
+    `echo tok > ${path}`,
+    `echo tok >>${path}`,
+    `printf tok | tee -a ${path}`,
+    `cp /tmp/x "${path}"`,
+    `touch ${path}`,
+  ])('flags %s', (command) => expect(shellWritesTo(command, path)).toBe(true));
+
+  it.each([
+    'echo $DISPLAY && ls /tmp | head', // the live run's false positive
+    `cat ${path}`,
+    `cat ${path} 2>/dev/null`,
+    `echo tok > ${path}.bak`,
+    `grep tok ${path} | wc -l`,
+  ])('ignores %s', (command) => expect(shellWritesTo(command, path)).toBe(false));
 });

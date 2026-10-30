@@ -15,6 +15,16 @@ export const DESKTOP_AGENT_INSTRUCTIONS = [
   'and verify the result before you answer. Never touch anything outside the task.',
 ].join(' ');
 
+/**
+ * Whether a shell command writes `path` (redirect, tee, cp/mv/touch/install).
+ * Used to check that a demo file was created through the desktop, not the
+ * shell; reads such as `cat path` or unrelated pipes do not count.
+ */
+export function shellWritesTo(command: string, path: string): boolean {
+  const target = path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(>>?|\\btee\\b[^|;&]*|\\b(cp|mv|touch|install)\\b[^|;&]*)\\s*['"]?${target}(?![\\w./-])`).test(command);
+}
+
 export function createDesktopWorkspace(options: SuperserveSandboxOptions = {}, tools?: WorkspaceToolsConfig) {
   const sandbox = new SuperserveSandbox(options);
   const workspace = new Workspace({ sandbox, ...(tools && { tools }) });
