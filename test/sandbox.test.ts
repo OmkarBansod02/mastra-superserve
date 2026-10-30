@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+import { inspect } from 'node:util';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   SandboxAbortError,
@@ -5,8 +7,8 @@ import {
   SandboxTimeoutError,
   SandboxUnsupportedFeatureError,
 } from '@mastra/core/workspace';
-import { AuthenticationError, NotFoundError, TimeoutError } from '@superserve/sdk';
-import { fakeVm, listRow, type FakeVm } from './fakes.js';
+import { AuthenticationError, NotFoundError, SandboxError as SdkSandboxError, TimeoutError } from '@superserve/sdk';
+import { fakeSession, fakeVm, listRow, type FakeSession, type FakeVm } from './fakes.js';
 
 const sdk = vi.hoisted(() => ({
   create: vi.fn(),
@@ -117,6 +119,7 @@ describe('construction & lazy creation', () => {
     [{ metadata: { [SANDBOX_ID_METADATA_KEY]: 'x' } }, /reserved/],
     [{ sandboxId: '' }, /sandboxId/],
     [{ liveView: 'open' as never }, /liveView/],
+    [{ commandTimeoutMs: 2 ** 31 }, /commandTimeoutMs/],
   ])('rejects unsafe option %j', (opts, msg) => {
     expect(() => new SuperserveSandbox(opts)).toThrow(msg);
   });
@@ -132,6 +135,20 @@ describe('construction & lazy creation', () => {
     expect(JSON.stringify(err.details)).not.toContain(secret);
     expect(JSON.stringify(await sandbox.getInfo())).not.toContain(secret);
     expect(sdk.create.mock.calls[0]![0].apiKey).toBe(secret); // passed to the SDK only
+  });
+
+  // Regression (Phase 4A): the key sat in enumerable fields — ours, and the SDK
+  // Sandbox's `_config` (which holds it even when it came from the env) — so
+  // console.log(sandbox) or JSON.stringify(sandbox) printed it.
+  it('never exposes the API key when the sandbox is logged or serialized', async () => {
+    const secret = 'unit-test-placeholder-key';
+    Object.assign(vm, { _config: { apiKey: secret, baseUrl: 'https://api.example.invalid' } }); // like the real SDK
+    const sandbox = new SuperserveSandbox({ apiKey: secret });
+    const exposed = () => JSON.stringify(sandbox).includes(secret) || inspect(sandbox, { depth: 10 }).includes(secret);
+    expect(exposed()).toBe(false);
+    await sandbox._start();
+    expect(sandbox.superserve).toBe(vm); // still reachable through the explicit escape hatch
+    expect(exposed()).toBe(false);
   });
 });
 
@@ -231,20 +248,127 @@ describe('executeCommand', () => {
     await expect(sandbox.executeCommand('echo', [1 as unknown as string])).rejects.toThrow(/args/);
     expect(sdk.create).not.toHaveBeenCalled();
   });
+
+  // Regression (Phase 4A): the model-facing execute_command tool accepts any
+  // number of seconds. The SDK turned 0 into a 5 s client abort, and negative
+  // or huge values (setTimeout overflow) into an immediate one.
+  it('timeout: 0 means "no per-call override" and uses the default timeout', async () => {
+    const sandbox = new SuperserveSandbox({ commandTimeoutMs: 1234 });
+    await sandbox.executeCommand('make', [], { timeout: 0 });
+    expect(vm.commands.run.mock.calls[0]![1]).toEqual({ timeoutMs: 1234 });
+  });
+
+  it.each([-1, -60_000, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31])(
+    'rejects timeout %s before touching the VM',
+    async (timeout) => {
+      const err = await rejection(new SuperserveSandbox().executeCommand('true', [], { timeout }));
+      expect(err).toBeInstanceOf(SandboxError);
+      expect(err.code).toBe('INVALID_ARGUMENT');
+      expect(err.message).toMatch(/timeout/);
+      expect(sdk.create).not.toHaveBeenCalled();
+    },
+  );
 });
 
 describe('writeFiles', () => {
-  it('writes each file through the files API', async () => {
+  const sha = (b: Uint8Array) => createHash('sha256').update(b).digest('hex');
+  const sessions = () => vm.commands.spawn.mock.results.map((r) => r.value as Promise<FakeSession>);
+
+  it('streams each file over spawn stdin and never uses the root-owned files API', async () => {
     const sandbox = new SuperserveSandbox();
-    const bin = Buffer.from([1, 2, 3]);
+    // Every byte value, including invalid UTF-8 and NUL.
+    const bin = Buffer.from(Array.from({ length: 256 }, (_, i) => i));
     await sandbox.writeFiles([
-      { path: '/tmp/a.txt', content: 'hello' },
+      { path: '/tmp/a.txt', content: 'héllo ✓' },
       { path: '/home/desktop/b.bin', content: bin },
     ]);
-    expect(vm.files.write.mock.calls).toEqual([
-      ['/tmp/a.txt', 'hello', undefined],
-      ['/home/desktop/b.bin', bin, undefined],
-    ]);
+
+    expect(vm.files.write).not.toHaveBeenCalled();
+    expect(vm.commands.run).not.toHaveBeenCalled();
+    expect(vm.commands.spawn).toHaveBeenCalledTimes(2);
+    const [a, b] = await Promise.all(sessions());
+    expect(a!.stdinBytes.equals(Buffer.from('héllo ✓', 'utf8'))).toBe(true);
+    expect(b!.stdinBytes.equals(bin)).toBe(true);
+    expect(a!.stdinClosed && b!.stdinClosed).toBe(true);
+
+    const [cmdA, optsA] = vm.commands.spawn.mock.calls[0]!;
+    expect(cmdA).toContain(`want=${sha(Buffer.from('héllo ✓', 'utf8'))}`);
+    expect(cmdA).toContain('dest=/tmp/a.txt');
+    expect(cmdA).not.toMatch(/sudo|chmod [0-7]{3}/);
+    expect(optsA).toEqual({ timeoutMs: 60_000 });
+    expect(vm.commands.spawn.mock.calls[1]![0]).toContain(`want=${sha(bin)}`);
+  });
+
+  it('writes an empty file', async () => {
+    await new SuperserveSandbox().writeFiles([{ path: '/tmp/empty', content: '' }]);
+    const [s] = await Promise.all(sessions());
+    expect(s!.stdinBytes.length).toBe(0);
+    expect(vm.commands.spawn.mock.calls[0]![0]).toContain(`want=${sha(new Uint8Array())}`);
+  });
+
+  it('shell-quotes hostile paths into the script', async () => {
+    const path = "/tmp/it's $(touch pwned) `id`;\nx";
+    await new SuperserveSandbox().writeFiles([{ path, content: 'x' }]);
+    expect(vm.commands.spawn.mock.calls[0]![0]).toContain(`dest='/tmp/it'\\''s $(touch pwned) \`id\`;\nx'`);
+  });
+
+  it('surfaces a failed write as WRITE_FAILED with the stderr, and stops the batch', async () => {
+    vm.commands.spawn.mockResolvedValueOnce(
+      fakeSession({ exitCode: 23, stderr: "sh: 1: cannot create /etc/.mastra-write-x.tmp: Permission denied\n" }),
+    );
+    const err = await rejection(
+      new SuperserveSandbox().writeFiles([
+        { path: '/etc/x', content: 'x' },
+        { path: '/tmp/never', content: 'y' },
+      ]),
+    );
+    expect(err).toBeInstanceOf(SandboxError);
+    expect(err.code).toBe('WRITE_FAILED');
+    expect(err.message).toMatch(/\/etc\/x.*exit 23.*Permission denied/s);
+    expect(err.details).toMatchObject({ path: '/etc/x', exitCode: 23 });
+    expect(vm.commands.spawn).toHaveBeenCalledTimes(1);
+    expect(vm.files.write).not.toHaveBeenCalled();
+  });
+
+  it('maps a server-side timeout (exit 124) to SandboxTimeoutError', async () => {
+    vm.commands.spawn.mockResolvedValueOnce(fakeSession({ exitCode: 124 }));
+    const err = await rejection(new SuperserveSandbox({ commandTimeoutMs: 5_000 }).writeFiles([{ path: '/tmp/x', content: 'x' }]));
+    expect(err).toBeInstanceOf(SandboxTimeoutError);
+    expect(err.timeoutMs).toBe(5_000);
+  });
+
+  it('gives up and closes the session when the exit is never reported', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const hung = fakeSession(null);
+      vm.commands.spawn.mockResolvedValueOnce(hung);
+      const p = rejection(new SuperserveSandbox({ commandTimeoutMs: 1_000 }).writeFiles([{ path: '/tmp/x', content: 'x' }]));
+      await vi.advanceTimersByTimeAsync(6_001);
+      const err = await p;
+      expect(err).toBeInstanceOf(SandboxTimeoutError);
+      expect(hung.close).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('aborts an in-flight write as SandboxAbortError and closes the session', async () => {
+    const ac = new AbortController();
+    const hung = fakeSession(null);
+    hung.close.mockImplementation(async () => {});
+    hung.wait.mockImplementation(
+      () =>
+        new Promise((_, reject) =>
+          ac.signal.addEventListener('abort', () => reject(new SdkSandboxError('exec/connect: connection closed'))),
+        ),
+    );
+    vm.commands.spawn.mockResolvedValueOnce(hung);
+    const p = rejection(new SuperserveSandbox().writeFiles([{ path: '/tmp/x', content: 'x' }], { abortSignal: ac.signal }));
+    await vi.waitFor(() => expect(hung.wait).toHaveBeenCalled());
+    ac.abort();
+    expect(await p).toBeInstanceOf(SandboxAbortError);
+    expect(vm.commands.spawn.mock.calls[0]![1]).toMatchObject({ signal: ac.signal });
+    expect(hung.close).toHaveBeenCalled();
   });
 
   it('rejects explicit modes instead of silently dropping them', async () => {
@@ -255,8 +379,17 @@ describe('writeFiles', () => {
     expect(sdk.create).not.toHaveBeenCalled();
   });
 
-  it.each(['relative/path', '/tmp/../etc/passwd'])('rejects unsafe path %s', async (path) => {
-    await expect(new SuperserveSandbox().writeFiles([{ path, content: 'x' }])).rejects.toThrow(/absolute/);
+  it.each(['relative/path', '/tmp/../etc/passwd', '/', '/tmp/dir/', '/tmp/nul\0byte'])(
+    'rejects unsafe path %j',
+    async (path) => {
+      await expect(new SuperserveSandbox().writeFiles([{ path, content: 'x' }])).rejects.toThrow(/absolute file path/);
+      expect(sdk.create).not.toHaveBeenCalled();
+    },
+  );
+
+  it('rejects non-string, non-Buffer content', async () => {
+    const err = await rejection(new SuperserveSandbox().writeFiles([{ path: '/tmp/x', content: 42 as never }]));
+    expect(err.code).toBe('INVALID_ARGUMENT');
     expect(sdk.create).not.toHaveBeenCalled();
   });
 });
@@ -465,7 +598,107 @@ describe('logical-id discovery', () => {
   });
 });
 
+describe('destroy racing an in-flight start', () => {
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<T>((res, rej) => ((resolve = res), (reject = rej)));
+    return { promise, resolve, reject };
+  }
+
+  /** After the race: exactly one VM, killed once, and nothing can revive the sandbox. */
+  async function expectDestroyedForGood(sandbox: InstanceType<typeof SuperserveSandbox>, killed: string | null) {
+    expect(sandbox.status).toBe('destroyed');
+    expect(sandbox.sandboxId).toBeUndefined();
+    if (killed) expect(sdk.killById.mock.calls).toEqual([[killed, {}]]);
+    else expect(sdk.killById).not.toHaveBeenCalled();
+    await expect(sandbox.executeCommand('true')).rejects.toThrow();
+    expect(sdk.create.mock.calls.length).toBeLessThanOrEqual(1);
+  }
+
+  it('_destroy() during create() waits for the VM and then kills it', async () => {
+    const created = deferred<FakeVm>();
+    sdk.create.mockReturnValueOnce(created.promise);
+    const sandbox = new SuperserveSandbox();
+
+    const starting = sandbox._start();
+    await vi.waitFor(() => expect(sdk.create).toHaveBeenCalled());
+    const destroying = sandbox._destroy();
+    expect(sdk.killById).not.toHaveBeenCalled(); // nothing to kill yet
+    created.resolve(vm);
+    await Promise.allSettled([starting, destroying]);
+
+    await expectDestroyedForGood(sandbox, 'vm-1');
+  });
+
+  it('_destroy() during connect() to an adopted VM kills it once attached', async () => {
+    sdk.list.mockResolvedValue([listRow('vm-1', { [TAG]: 'logical' })]);
+    const connected = deferred<FakeVm>();
+    sdk.connect.mockReturnValueOnce(connected.promise);
+    const sandbox = new SuperserveSandbox({ id: 'logical' });
+
+    const starting = sandbox._start();
+    await vi.waitFor(() => expect(sdk.connect).toHaveBeenCalled());
+    const destroying = sandbox._destroy();
+    connected.resolve(vm);
+    await Promise.allSettled([starting, destroying]);
+
+    await expectDestroyedForGood(sandbox, 'vm-1');
+    expect(sdk.create).not.toHaveBeenCalled();
+  });
+
+  it('_destroy() during a create() that fails leaves nothing to kill', async () => {
+    const created = deferred<FakeVm>();
+    sdk.create.mockReturnValueOnce(created.promise);
+    const sandbox = new SuperserveSandbox();
+
+    const starting = sandbox._start();
+    await vi.waitFor(() => expect(sdk.create).toHaveBeenCalled());
+    const destroying = sandbox._destroy();
+    created.reject(new TimeoutError('create timed out'));
+    const [start] = await Promise.allSettled([starting, destroying]);
+
+    expect(start.status).toBe('rejected');
+    await expectDestroyedForGood(sandbox, null);
+  });
+
+  it('_destroy() during the lazy start of an operation kills the VM that start created', async () => {
+    const created = deferred<FakeVm>();
+    sdk.create.mockReturnValueOnce(created.promise);
+    const sandbox = new SuperserveSandbox();
+
+    const op = sandbox.executeCommand('echo hi');
+    await vi.waitFor(() => expect(sdk.create).toHaveBeenCalled());
+    const destroying = sandbox._destroy();
+    created.resolve(vm);
+    await Promise.allSettled([op, destroying]);
+
+    await expectDestroyedForGood(sandbox, 'vm-1');
+  });
+
+  // Regression (Phase 4A): destroy() is also documented to work when called
+  // directly. Mid-start it saw no VM yet, returned 'destroyed', and the VM
+  // that start() was still creating came up afterwards — alive and 'running'.
+  it('a direct destroy() during create() waits for the VM and then kills it', async () => {
+    const created = deferred<FakeVm>();
+    sdk.create.mockReturnValueOnce(created.promise);
+    const sandbox = new SuperserveSandbox();
+
+    const starting = sandbox._start();
+    await vi.waitFor(() => expect(sdk.create).toHaveBeenCalled());
+    const destroying = sandbox.destroy();
+    created.resolve(vm);
+    await Promise.allSettled([starting, destroying]);
+
+    await expectDestroyedForGood(sandbox, 'vm-1');
+  });
+});
+
 describe('VM loss during an operation', () => {
+  /** What the SDK throws when fetch itself fails (http.ts). */
+  const networkError = () =>
+    new SdkSandboxError('Network error: fetch failed', undefined, undefined, { cause: new TypeError('fetch failed') });
+
   it('a 404 confirmed by the control plane becomes SANDBOX_GONE and clears the VM', async () => {
     const sandbox = new SuperserveSandbox();
     await sandbox._start();
@@ -485,6 +718,51 @@ describe('VM loss during an operation', () => {
     expect(err.code).toBe('PROVIDER_NOT_FOUND');
     expect(sandbox.status).toBe('running');
     expect(sandbox.sandboxId).toBe('vm-1');
+  });
+
+  // Regression (Phase 4A, found live): once a VM is killed, its data plane
+  // fails at the transport level (the SDK's status-less "Network error: fetch
+  // failed"), not with a 404, so out-of-band deletion was never detected.
+  it('a network error confirmed by the control plane becomes SANDBOX_GONE', async () => {
+    const sandbox = new SuperserveSandbox();
+    await sandbox._start();
+    vm.commands.run.mockRejectedValueOnce(networkError());
+    vm.getInfo.mockRejectedValueOnce(new NotFoundError('sandbox not found'));
+    const err = await rejection(sandbox.executeCommand('true'));
+    expect(err.code).toBe('SANDBOX_GONE');
+    expect(sandbox.status).toBe('error');
+    expect(sandbox.sandboxId).toBeUndefined();
+  });
+
+  it('a network error while the VM is alive stays a provider error and keeps the VM', async () => {
+    const sandbox = new SuperserveSandbox();
+    await sandbox._start();
+    vm.commands.run.mockRejectedValueOnce(networkError());
+    const err = await rejection(sandbox.executeCommand('true'));
+    expect(err.code).toBe('PROVIDER_ERROR');
+    expect(sandbox.status).toBe('running');
+    expect(sandbox.sandboxId).toBe('vm-1');
+  });
+
+  // Regression (Phase 4A): an operation in flight during destroy() saw the kill
+  // as VM loss and overwrote 'destroyed' with 'error', which let the next call
+  // create a brand-new VM that nothing would ever destroy.
+  it('an operation failing after destroy() does not revive the sandbox', async () => {
+    const sandbox = new SuperserveSandbox();
+    await sandbox._start();
+    let failInFlight!: (e: Error) => void;
+    vm.commands.run.mockImplementationOnce(() => new Promise((_, reject) => (failInFlight = reject)));
+    vm.getInfo.mockRejectedValueOnce(new NotFoundError('sandbox not found'));
+
+    const inFlight = sandbox.executeCommand('sleep 30');
+    await vi.waitFor(() => expect(vm.commands.run).toHaveBeenCalled());
+    await sandbox._destroy();
+    failInFlight(new NotFoundError('not found'));
+
+    expect((await rejection(inFlight)).code).toBe('SANDBOX_GONE');
+    expect(sandbox.status).toBe('destroyed');
+    await expect(sandbox.executeCommand('true')).rejects.toThrow();
+    expect(sdk.create).toHaveBeenCalledTimes(1);
   });
 });
 

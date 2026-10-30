@@ -15,7 +15,7 @@
  *
  * @see https://superserve.ai
  */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type {
   CommandResult,
   ComputerPosition,
@@ -44,6 +44,7 @@ import {
   NotFoundError as SdkNotFoundError,
   RateLimitError as SdkRateLimitError,
   Sandbox as SdkSandbox,
+  SandboxError as SdkSandboxError,
   TimeoutError as SdkTimeoutError,
   ValidationError as SdkValidationError,
 } from '@superserve/sdk';
@@ -57,6 +58,7 @@ import {
   parseMouseLocation,
   pngSize,
   shellQuote,
+  writeFileScript,
 } from './utils.js';
 
 /** Metadata key tagging a VM with the logical Mastra sandbox id that created it. */
@@ -69,7 +71,14 @@ export const DEFAULT_AUTO_DELETE_SECONDS = 600;
 /** X display of the `superserve/desktop` template (Phase 1). */
 export const DEFAULT_DISPLAY = ':1';
 const DEFAULT_COMMAND_TIMEOUT_MS = 60_000;
+/**
+ * The SDK arms a client timer at `timeoutMs + 5000`; Node fires timers past
+ * 2^31-1 ms immediately, so anything larger would abort the call at once.
+ */
+const MAX_COMMAND_TIMEOUT_MS = 2_147_483_647 - 5_000;
 const DEFAULT_CURSOR_QUERY_TIMEOUT_MS = 10_000;
+/** How long past the server-side timeout a file write waits for its exit report. */
+const WRITE_CLIENT_GRACE_MS = 5_000;
 const DEFAULT_PAUSE_TIMEOUT_MS = 120_000;
 /** Superserve rejects VM names outside 1–64 characters (found live in Phase 3). */
 const MAX_VM_NAME_LENGTH = 64;
@@ -158,7 +167,10 @@ export interface SuperserveSandboxOptions extends Omit<MastraSandboxOptions, 'pr
   liveView?: PreviewAccessPolicy | false;
   /** X display used for the xdotool cursor query. @default ':1' */
   display?: string;
-  /** Default timeout for `executeCommand`. @default 60000 */
+  /**
+   * Default timeout for `executeCommand`, also used when a call passes
+   * `timeout: 0` (Superserve has no unbounded commands). @default 60000
+   */
   commandTimeoutMs?: number;
   /** Superserve API key. Falls back to the SUPERSERVE_API_KEY env var. */
   apiKey?: string;
@@ -191,7 +203,14 @@ export class SuperserveSandbox extends MastraSandbox<AttachTarget> {
   readonly provider = 'superserve';
   status: ProviderStatus = 'pending';
 
-  private _sandbox: SdkSandbox | null = null;
+  /**
+   * The SDK handle and the connection options both carry the API key (the
+   * SDK keeps it in its own `_config`, even when it came from the env).
+   * JS-private so `console.log(sandbox)` / `JSON.stringify(sandbox)` never
+   * print it.
+   */
+  #sandbox: SdkSandbox | null = null;
+  readonly #connection: ConnectionOptions;
   /** The VM this instance is attached to; kept across `stop()` so it can resume. */
   private _attached?: AttachTarget;
   private _attachedAt?: Date;
@@ -209,7 +228,6 @@ export class SuperserveSandbox extends MastraSandbox<AttachTarget> {
   private readonly _metadata: Record<string, string>;
   private readonly _liveView: PreviewAccessPolicy | false;
   private readonly _display: string;
-  private readonly _connection: ConnectionOptions;
 
   constructor(options: SuperserveSandboxOptions = {}) {
     super({ ...options, name: 'SuperserveSandbox' });
@@ -246,8 +264,8 @@ export class SuperserveSandbox extends MastraSandbox<AttachTarget> {
       throw invalidArgument(`metadata key "${SANDBOX_ID_METADATA_KEY}" is reserved`);
     }
     const commandTimeoutMs = options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
-    if (!Number.isSafeInteger(commandTimeoutMs) || commandTimeoutMs < 1) {
-      throw invalidArgument('commandTimeoutMs must be a positive integer');
+    if (!Number.isSafeInteger(commandTimeoutMs) || commandTimeoutMs < 1 || commandTimeoutMs > MAX_COMMAND_TIMEOUT_MS) {
+      throw invalidArgument(`commandTimeoutMs must be a positive integer up to ${MAX_COMMAND_TIMEOUT_MS}`);
     }
 
     this.id = options.id ?? `superserve-${randomUUID()}`;
@@ -263,7 +281,7 @@ export class SuperserveSandbox extends MastraSandbox<AttachTarget> {
     this._liveView = liveView;
     this._display = display;
     this.defaultCommandTimeout = commandTimeoutMs;
-    this._connection = {
+    this.#connection = {
       ...(options.apiKey !== undefined && { apiKey: options.apiKey }),
       ...(options.baseUrl !== undefined && { baseUrl: options.baseUrl }),
     };
@@ -294,8 +312,8 @@ export class SuperserveSandbox extends MastraSandbox<AttachTarget> {
    * @throws {SandboxNotReadyError} If the sandbox is not running
    */
   get superserve(): SdkSandbox {
-    if (!this._sandbox) throw new SandboxNotReadyError(this.id);
-    return this._sandbox;
+    if (!this.#sandbox) throw new SandboxNotReadyError(this.id);
+    return this.#sandbox;
   }
 
   // -------------------------------------------------------------------------
@@ -327,7 +345,7 @@ export class SuperserveSandbox extends MastraSandbox<AttachTarget> {
     let sdk: SdkSandbox;
     try {
       // POST /activate: resumes a paused VM and returns a fresh access token.
-      sdk = await SdkSandbox.connect(target.sandboxId, this._connection);
+      sdk = await SdkSandbox.connect(target.sandboxId, this.#connection);
     } catch (error) {
       if (error instanceof SdkNotFoundError) {
         this.forgetVm();
@@ -342,7 +360,7 @@ export class SuperserveSandbox extends MastraSandbox<AttachTarget> {
         { sandboxId: target.sandboxId, returnedId: sdk.id },
       );
     }
-    this._sandbox = sdk;
+    this.#sandbox = sdk;
     this._attached = target;
     this._attachedAt = new Date();
     this._screenSize = undefined;
@@ -353,7 +371,7 @@ export class SuperserveSandbox extends MastraSandbox<AttachTarget> {
     let sdk: SdkSandbox;
     try {
       sdk = await SdkSandbox.create({
-        ...this._connection,
+        ...this.#connection,
         name: this.vmName(),
         fromTemplate: this._template,
         timeoutSeconds: this._timeoutSeconds,
@@ -364,7 +382,7 @@ export class SuperserveSandbox extends MastraSandbox<AttachTarget> {
     } catch (error) {
       throw this.toMastraError(error, 'create', 'control');
     }
-    this._sandbox = sdk;
+    this.#sandbox = sdk;
     this._attached = { sandboxId: sdk.id, ownership: 'created' };
     this._attachedAt = new Date();
     this._screenSize = undefined;
@@ -380,7 +398,7 @@ export class SuperserveSandbox extends MastraSandbox<AttachTarget> {
     let infos;
     try {
       // The SDK has no non-activating get-by-id, so list attachable VMs.
-      infos = await SdkSandbox.list({ ...this._connection, status: ATTACHABLE_STATUSES });
+      infos = await SdkSandbox.list({ ...this.#connection, status: ATTACHABLE_STATUSES });
     } catch (error) {
       throw this.toMastraError(error, 'list', 'control');
     }
@@ -402,7 +420,7 @@ export class SuperserveSandbox extends MastraSandbox<AttachTarget> {
     let infos;
     try {
       infos = await SdkSandbox.list({
-        ...this._connection,
+        ...this.#connection,
         metadata: { [SANDBOX_ID_METADATA_KEY]: this.id },
         status: ATTACHABLE_STATUSES,
       });
@@ -433,14 +451,14 @@ export class SuperserveSandbox extends MastraSandbox<AttachTarget> {
    * counting from the pause.
    */
   async stop(): Promise<void> {
-    if (!this._sandbox) return;
+    if (!this.#sandbox) return;
     try {
-      await this._sandbox.pause({ wait: true, timeoutMs: DEFAULT_PAUSE_TIMEOUT_MS });
+      await this.#sandbox.pause({ wait: true, timeoutMs: DEFAULT_PAUSE_TIMEOUT_MS });
     } catch (error) {
       throw this.toMastraError(error, 'pause', 'control');
     }
-    this.logger.debug(`Paused Superserve sandbox ${this._sandbox.id} for ${this.id}`);
-    this._sandbox = null;
+    this.logger.debug(`Paused Superserve sandbox ${this.#sandbox.id} for ${this.id}`);
+    this.#sandbox = null;
     // Keep status truthful when stop() is called directly instead of via _stop().
     this.status = 'stopped';
   }
@@ -451,6 +469,9 @@ export class SuperserveSandbox extends MastraSandbox<AttachTarget> {
    * this instance did not attach to.
    */
   async destroy(): Promise<void> {
+    // Called directly (not via _destroy()) mid-start, there is no VM yet; the
+    // one start() is creating would come up after we returned 'destroyed'.
+    if (this._startPromise) await this._startPromise.catch(() => {});
     const target = this._attached;
     if (!target) {
       this.status = 'destroyed';
@@ -461,7 +482,7 @@ export class SuperserveSandbox extends MastraSandbox<AttachTarget> {
     if (kill) {
       try {
         // DELETE /sandboxes/:id — works on paused VMs without resuming them.
-        await SdkSandbox.killById(target.sandboxId, this._connection);
+        await SdkSandbox.killById(target.sandboxId, this.#connection);
       } catch (error) {
         throw this.toMastraError(error, 'kill', 'control');
       }
@@ -483,18 +504,31 @@ export class SuperserveSandbox extends MastraSandbox<AttachTarget> {
   /**
    * Run a shell command and wait for it. `command` is a shell string; each
    * entry of `args` is shell-quoted and appended. A non-zero exit code is
-   * returned in the result, not thrown.
+   * returned in the result, not thrown. `timeout: 0` uses the default
+   * timeout (`commandTimeoutMs`).
    */
   async executeCommand(command: string, args?: string[], options: ExecuteCommandOptions = {}): Promise<CommandResult> {
     if (typeof command !== 'string' || command.trim() === '') throw invalidArgument('command must be a non-empty string');
     if (args !== undefined && (!Array.isArray(args) || args.some((a) => typeof a !== 'string'))) {
       throw invalidArgument('args must be an array of strings');
     }
+    if (
+      options.timeout != null &&
+      (typeof options.timeout !== 'number' ||
+        !Number.isFinite(options.timeout) ||
+        options.timeout < 0 ||
+        options.timeout > MAX_COMMAND_TIMEOUT_MS)
+    ) {
+      throw invalidArgument(
+        `timeout must be between 0 and ${MAX_COMMAND_TIMEOUT_MS} ms, got ${String(options.timeout)}`,
+        { timeout: options.timeout },
+      );
+    }
     const signal = options.abortSignal;
     if (signal?.aborted) throw new SandboxAbortError('executeCommand', signal.reason);
 
     const fullCommand = args?.length ? `${command} ${args.map(shellQuote).join(' ')}` : command;
-    const timeout = options.timeout ?? this.defaultCommandTimeout;
+    const timeout = options.timeout || this.defaultCommandTimeout;
     const env = definedEnv({ ...this.getEnv(), ...options.env });
     const cwd = options.cwd ?? this.workingDirectory;
     const started = Date.now();
@@ -529,15 +563,36 @@ export class SuperserveSandbox extends MastraSandbox<AttachTarget> {
   }
 
   /**
-   * Write files into the VM through the Superserve files API (parent
-   * directories are created). Paths must be absolute. Per-file `mode` is not
-   * supported and is rejected rather than ignored.
+   * Write files into the VM as the sandbox's command user (`desktop` on the
+   * desktop template), creating missing parent directories. Each file's bytes
+   * are streamed over a `commands.spawn` stdin, checksummed in the VM, and
+   * atomically renamed into place (see `writeFileScript`), so a failed write
+   * never leaves a partial file. Files are written in order; the first
+   * failure stops the batch.
+   *
+   * Superserve's files API is deliberately not used: it writes as root, and
+   * the desktop user then cannot modify, rename or delete what it wrote.
+   * Consequently writes are subject to the command user's permissions: a path
+   * that user cannot write (e.g. under `/etc`) fails with `WRITE_FAILED`.
+   *
+   * Paths must be absolute. Per-file `mode` is not supported and is rejected
+   * rather than ignored; an overwritten file keeps its mode. Each file is
+   * bounded by `commandTimeoutMs`.
    */
   async writeFiles(files: SandboxFileInput[], options: WriteFilesOptions = {}): Promise<void> {
     assertModesUnsupported(files, 'Superserve');
     for (const f of files) {
-      if (typeof f.path !== 'string' || !f.path.startsWith('/') || f.path.split('/').includes('..')) {
-        throw invalidArgument(`writeFiles: path must be absolute without ".." segments, got "${f.path}"`);
+      if (
+        typeof f.path !== 'string' ||
+        !f.path.startsWith('/') ||
+        f.path.endsWith('/') ||
+        f.path.includes('\0') ||
+        f.path.split('/').includes('..')
+      ) {
+        throw invalidArgument(`writeFiles: path must be an absolute file path without ".." segments, got "${f.path}"`);
+      }
+      if (typeof f.content !== 'string' && !(f.content instanceof Uint8Array)) {
+        throw invalidArgument(`writeFiles: content for "${f.path}" must be a string or Buffer`);
       }
     }
     const signal = options.abortSignal;
@@ -548,10 +603,54 @@ export class SuperserveSandbox extends MastraSandbox<AttachTarget> {
       async (sb) => {
         for (const f of files) {
           if (signal?.aborted) throw new SandboxAbortError('writeFiles', signal.reason);
-          await sb.files.write(f.path, f.content, signal ? { signal } : undefined);
+          const bytes = typeof f.content === 'string' ? Buffer.from(f.content, 'utf8') : f.content;
+          await this.writeFileAsCommandUser(sb, f.path, bytes, signal);
         }
       },
       { signal },
+    );
+  }
+
+  private async writeFileAsCommandUser(
+    sb: SdkSandbox,
+    path: string,
+    bytes: Uint8Array,
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
+    const timeoutMs = this.defaultCommandTimeout ?? DEFAULT_COMMAND_TIMEOUT_MS;
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    const session = await sb.commands.spawn(writeFileScript(path, sha256, randomUUID()), {
+      timeoutMs,
+      ...(signal && { signal }),
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let result;
+    try {
+      // The SDK chunks this into 32 KiB frames; the in-VM checksum catches any
+      // frame it drops (writes on a closed socket are silent no-ops).
+      session.stdin.write(bytes);
+      session.stdin.close();
+      // Backstop for a connection that never reports the exit.
+      const deadline = new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new SandboxTimeoutError(timeoutMs, 'command')),
+          timeoutMs + WRITE_CLIENT_GRACE_MS,
+        );
+      });
+      result = await Promise.race([session.wait(), deadline]);
+    } catch (error) {
+      await session.close();
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+    if (result.exitCode === 0) return;
+    if (result.exitCode === 124) throw new SandboxTimeoutError(timeoutMs, 'command');
+    const stderr = result.stderr.trim().slice(0, 500);
+    throw new SandboxError(
+      `writeFiles: could not write ${path} as the sandbox user (exit ${result.exitCode})${stderr ? `: ${stderr}` : ''}`,
+      'WRITE_FAILED',
+      { provider: this.provider, path, exitCode: result.exitCode, stderr },
     );
   }
 
@@ -719,8 +818,9 @@ export class SuperserveSandbox extends MastraSandbox<AttachTarget> {
 
   /**
    * Ensure the VM is running, run `fn` against it, and map SDK failures onto
-   * Mastra errors. A 404 is only treated as "VM gone" after the control plane
-   * confirms it.
+   * Mastra errors. A 404 or a transport failure (a killed VM's data plane
+   * fails with the latter) is only treated as "VM gone" after the control
+   * plane confirms it.
    */
   private async withLive<T>(
     op: string,
@@ -729,14 +829,16 @@ export class SuperserveSandbox extends MastraSandbox<AttachTarget> {
     ctx: { timeoutMs?: number; signal?: AbortSignal } = {},
   ): Promise<T> {
     await this.ensureRunning();
-    const sb = this._sandbox;
+    const sb = this.#sandbox;
     if (!sb) throw new SandboxNotReadyError(this.id);
     try {
       return await fn(sb);
     } catch (error) {
-      if (error instanceof SdkNotFoundError && (await this.confirmGone(sb))) {
+      if ((error instanceof SdkNotFoundError || isTransportError(error)) && (await this.confirmGone(sb))) {
         this.forgetVm();
-        this.status = 'error';
+        // An operation racing destroy() sees the kill as VM loss. Never turn
+        // 'destroyed' back into 'error': that would let start() create a new VM.
+        if (this.status !== 'destroying' && this.status !== 'destroyed') this.status = 'error';
         throw this.goneError(sb.id, error);
       }
       throw this.toMastraError(error, op, kind, ctx);
@@ -754,7 +856,7 @@ export class SuperserveSandbox extends MastraSandbox<AttachTarget> {
   }
 
   private forgetVm(): void {
-    this._sandbox = null;
+    this.#sandbox = null;
     this._attached = undefined;
     this._screenSize = undefined;
   }
@@ -826,6 +928,15 @@ export class SuperserveSandbox extends MastraSandbox<AttachTarget> {
 function sizeOf(png: Uint8Array): ComputerScreenSize {
   // takeScreenshot() already verified the header.
   return pngSize(png)!;
+}
+
+/** The SDK's status-less "Network error: …" wrapping a failed fetch (not a timeout or an abort). */
+function isTransportError(error: unknown): boolean {
+  if (!(error instanceof SdkSandboxError) || error.constructor !== SdkSandboxError || error.statusCode !== undefined) {
+    return false;
+  }
+  const cause = error.cause as { name?: unknown } | undefined;
+  return cause !== undefined && cause?.name !== 'AbortError';
 }
 
 function definedEnv(env: Record<string, string | undefined>): Record<string, string> {

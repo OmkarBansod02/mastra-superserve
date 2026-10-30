@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { normalizeKey, parseMouseLocation, pngSize, shellQuote } from '../src/utils.js';
+import { normalizeKey, parseMouseLocation, pngSize, shellQuote, writeFileScript } from '../src/utils.js';
 import { fakePng } from './fakes.js';
 
 describe('normalizeKey', () => {
@@ -65,5 +65,21 @@ describe('parseMouseLocation', () => {
     expect(parseMouseLocation('X=1\n')).toBeNull();
     expect(parseMouseLocation('X=a\nY=2')).toBeNull();
     expect(parseMouseLocation('')).toBeNull();
+  });
+});
+
+describe('writeFileScript', () => {
+  const sha = 'a'.repeat(64);
+
+  it('only interpolates validated checksum and temp id values', () => {
+    expect(() => writeFileScript('/tmp/x', 'A'.repeat(64), 'id')).toThrow(/sha256/);
+    expect(() => writeFileScript('/tmp/x', `${sha.slice(1)};`, 'id')).toThrow(/sha256/);
+    expect(() => writeFileScript('/tmp/x', sha, '../x')).toThrow(/tempId/);
+    expect(() => writeFileScript('/tmp/x', sha, '$(id)')).toThrow(/tempId/);
+  });
+
+  it('uses no privilege escalation or blanket chmod', () => {
+    const script = writeFileScript('/tmp/x', sha, 'abc');
+    expect(script).not.toMatch(/\bsudo\b|\bsu\b|chmod\s+[0-7]+|chown/);
   });
 });

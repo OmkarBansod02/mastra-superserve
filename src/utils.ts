@@ -223,3 +223,67 @@ export function parseMouseLocation(stdout: string): { x: number; y: number } | n
   if (xs === undefined || ys === undefined || !/^\d+$/.test(xs) || !/^\d+$/.test(ys)) return null;
   return { x: Number(xs), y: Number(ys) };
 }
+
+// ---------------------------------------------------------------------------
+// File writes
+// ---------------------------------------------------------------------------
+
+/** Exit codes of {@link writeFileScript}; anything else came from the shell or the server. */
+export const WRITE_EXIT = {
+  SYMLINK: 20,
+  IS_DIRECTORY: 21,
+  MKDIR: 22,
+  CREATE_TEMP: 23,
+  WRITE_TEMP: 24,
+  CHECKSUM_TOOL: 25,
+  CHECKSUM_MISMATCH: 26,
+  RENAME: 27,
+} as const;
+
+/**
+ * A POSIX `sh` script, run as the sandbox's command user, that reads a file's
+ * bytes from stdin and installs them at `dest`.
+ *
+ * Phase 4A found that Superserve's files API writes as root (root-owned files
+ * and parent dirs the desktop user can't edit, rename or delete). Running the
+ * write as an ordinary command fixes ownership. To keep it safe:
+ * - bytes go to a fresh temp file in the destination directory (`set -C`, so
+ *   an existing file or symlink there is never followed), are checked against
+ *   the caller's SHA-256 (stdin writes after a dropped socket are silently
+ *   discarded by the SDK), and only then renamed over `dest`. A failed or
+ *   partial write leaves `dest` untouched and removes the temp file.
+ * - `mv -T` refuses to move the file *into* `dest` when `dest` is a directory.
+ * - an existing file keeps its mode; a new one gets the umask default.
+ * - a symlink at `dest` is written through to its target, like `open(2)`:
+ *   it is resolved (`readlink -f`, chains and relative links included)
+ *   *before* the rename, so `mv -fT` replaces the target file, never the
+ *   link itself. A dangling link creates its target; a link to a directory
+ *   or into a missing directory fails.
+ * - permissions are the kernel's: no sudo, no chmod beyond the above.
+ */
+export function writeFileScript(dest: string, sha256: string, tempId: string): string {
+  if (!/^[0-9a-f]{64}$/.test(sha256)) throw new Error('writeFileScript: sha256 must be 64 lowercase hex chars');
+  if (!/^[A-Za-z0-9-]{1,64}$/.test(tempId)) throw new Error('writeFileScript: tempId must be alphanumeric');
+  const E = WRITE_EXIT;
+  return [
+    'set -u',
+    `dest=${shellQuote(dest)}`,
+    `want=${sha256}`,
+    `fail() { s=$1; shift; printf 'writeFiles: %s\\n' "$*" >&2; exit "$s"; }`,
+    `if [ -L "$dest" ]; then real=$(readlink -f -- "$dest") || fail ${E.SYMLINK} "cannot resolve symlink $dest"; dest=$real; fi`,
+    `if [ -d "$dest" ]; then fail ${E.IS_DIRECTORY} "$dest is a directory"; fi`,
+    'dir=${dest%/*}',
+    '[ -n "$dir" ] || dir=/',
+    `mkdir -p -- "$dir" || fail ${E.MKDIR} "cannot create directory $dir"`,
+    `tmp="$dir/.mastra-write-${tempId}.tmp"`,
+    `(set -C; : > "$tmp") || fail ${E.CREATE_TEMP} "cannot create a file in $dir"`,
+    `trap 'rm -f -- "$tmp"' EXIT`,
+    `trap 'exit 143' HUP INT TERM`,
+    `cat >> "$tmp" || fail ${E.WRITE_TEMP} "cannot write $tmp"`,
+    `got=$(sha256sum < "$tmp") || fail ${E.CHECKSUM_TOOL} "sha256sum failed"`,
+    `[ "\${got%% *}" = "$want" ] || fail ${E.CHECKSUM_MISMATCH} "content for $dest arrived incomplete (sha256 mismatch)"`,
+    `if [ -e "$dest" ]; then chmod --reference="$dest" -- "$tmp" 2>/dev/null; fi`,
+    `mv -fT -- "$tmp" "$dest" || fail ${E.RENAME} "cannot replace $dest"`,
+    'trap - EXIT',
+  ].join('\n');
+}

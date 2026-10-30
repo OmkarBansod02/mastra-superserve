@@ -12,6 +12,45 @@ export function fakePng(width: number, height: number): Uint8Array {
   return buf;
 }
 
+/**
+ * A stand-in for a `commands.spawn` session: records what was written to
+ * stdin and settles `wait()` with `result` (or never, when `result` is null).
+ */
+export function fakeSession(result: { exitCode: number; stderr?: string } | null = { exitCode: 0 }) {
+  const chunks: Uint8Array[] = [];
+  let stdinClosed = false;
+  let settle: ((r: { stdout: string; stderr: string; exitCode: number; truncated: boolean }) => void) | undefined;
+  let fail: ((e: unknown) => void) | undefined;
+  const done = new Promise<{ stdout: string; stderr: string; exitCode: number; truncated: boolean }>((res, rej) => {
+    settle = res;
+    fail = rej;
+  });
+  done.catch(() => {});
+  return {
+    get stdinBytes() {
+      return Buffer.concat(chunks);
+    },
+    get stdinClosed() {
+      return stdinClosed;
+    },
+    stdin: {
+      write: vi.fn((data: string | Uint8Array) => {
+        chunks.push(typeof data === 'string' ? Buffer.from(data) : Buffer.from(data));
+      }),
+      close: vi.fn(() => {
+        stdinClosed = true;
+        if (result) settle!({ stdout: '', stderr: result.stderr ?? '', exitCode: result.exitCode, truncated: false });
+      }),
+    },
+    kill: vi.fn(),
+    wait: vi.fn(() => done),
+    close: vi.fn(async () => {
+      fail!(new Error('closed'));
+    }),
+  };
+}
+export type FakeSession = ReturnType<typeof fakeSession>;
+
 /** A stand-in for an `@superserve/sdk` Sandbox instance. */
 export function fakeVm(id: string, opts: { width?: number; height?: number } = {}) {
   const width = opts.width ?? 1280;
@@ -22,6 +61,7 @@ export function fakeVm(id: string, opts: { width?: number; height?: number } = {
     metadata: {},
     commands: {
       run: vi.fn(async (_command: string, _opts?: Record<string, unknown>) => ({ stdout: '', stderr: '', exitCode: 0, truncated: false })),
+      spawn: vi.fn(async (_command: string, _opts?: Record<string, unknown>) => fakeSession()),
     },
     files: { write: vi.fn(async (_path: string, _content: unknown, _opts?: unknown) => {}) },
     desktop: {
