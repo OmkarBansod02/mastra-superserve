@@ -71,6 +71,8 @@ export const DEFAULT_DISPLAY = ':1';
 const DEFAULT_COMMAND_TIMEOUT_MS = 60_000;
 const DEFAULT_CURSOR_QUERY_TIMEOUT_MS = 10_000;
 const DEFAULT_PAUSE_TIMEOUT_MS = 120_000;
+/** Superserve rejects VM names outside 1–64 characters (found live in Phase 3). */
+const MAX_VM_NAME_LENGTH = 64;
 
 /** Every non-terminal VM status — the ones a sandbox can be reattached from. */
 const ATTACHABLE_STATUSES: readonly SandboxStatus[] = [
@@ -809,9 +811,15 @@ export class SuperserveSandbox extends MastraSandbox<AttachTarget> {
     return withCause(new SandboxError(`Superserve ${op} failed: ${reason}`, 'PROVIDER_ERROR', details), error);
   }
 
+  /**
+   * `<prefix>-<logical id>-<timestamp>`, clamped to Superserve's name limit.
+   * The timestamp suffix is always kept so names stay unique; the full
+   * logical id is in the VM metadata anyway.
+   */
   private vmName(): string {
-    const safe = this.id.replace(/[^a-zA-Z0-9-]/g, '-').slice(0, 48);
-    return `${this._namePrefix}-${safe}-${Date.now().toString(36)}`;
+    const suffix = `-${Date.now().toString(36)}`;
+    const safe = this.id.replace(/[^a-zA-Z0-9-]/g, '-');
+    return `${this._namePrefix}-${safe}`.slice(0, MAX_VM_NAME_LENGTH - suffix.length) + suffix;
   }
 }
 

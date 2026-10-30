@@ -73,6 +73,23 @@ describe('construction & lazy creation', () => {
     expect(sandbox.ownership).toBe('created');
   });
 
+  // Regression (Phase 3, live): Superserve rejects names over 64 characters, and
+  // prefix + generated id + timestamp exceeded that for any prefix over 7 chars.
+  it.each<[{ namePrefix?: string; id?: string }]>([
+    [{ namePrefix: 'mastra-phase3' }],
+    [{ namePrefix: 'p'.repeat(80) }],
+    [{ id: 'x'.repeat(200) }],
+    [{}],
+  ])('keeps generated VM names within 64 characters (%j)', async (opts) => {
+    const sandbox = new SuperserveSandbox(opts);
+    await sandbox._start();
+    const name: string = sdk.create.mock.calls[0]![0].name;
+    expect(name.length).toBeGreaterThanOrEqual(1);
+    expect(name.length).toBeLessThanOrEqual(64);
+    expect(name).toMatch(/-[0-9a-z]+$/); // unique timestamp suffix survives truncation
+    expect(name.startsWith((opts.namePrefix ?? 'mastra').slice(0, 10))).toBe(true);
+  });
+
   it('coalesces concurrent first operations into one VM', async () => {
     const sandbox = new SuperserveSandbox();
     await Promise.all([sandbox.executeCommand('a'), sandbox.executeCommand('b'), sandbox.computer.type('x')]);
