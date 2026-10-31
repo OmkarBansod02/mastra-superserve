@@ -107,6 +107,10 @@ Copy `.env.example` to `.env` and fill it in. `.env` is git-ignored.
 | `OPENAI_MODEL` | `example:agent` | Default `gpt-5.4-mini`. Must support tool calls and image input. |
 | `MAX_STEPS` | `example:agent` | Agent step budget, 1–15. Default 10. |
 | `DEBUG_IMAGES` | `example:agent` | `1` to log screenshots sent to OpenAI (ids and sizes only). |
+| `DEMO_MODE` | `example:agent` | `1` for recording mode: live `[AGENT]` tool-call logs and a scripted pause/reattach showcase. See `docs/DEMO.md`. |
+| `DEMO_VIEWER`, `DEMO_VIEWER_PORT` | `example:agent` | With `DEMO_MODE`, `1` serves `http://localhost:7777/` as a redirect to a private, view-only desktop viewer. |
+| `DEMO_SETUP_EDITOR` | `example:agent` | `1` installs Mousepad (apt-get, passwordless sudo) before the agent runs when the VM has no GUI text editor. Logged as `[SETUP]`; fails before any model call if unsupported. |
+| `DEMO_SETUP_ONLY` | `example:agent` | `1` only checks the Mousepad install on one VM: creates it, installs and verifies Mousepad, prints `[SETUP] PASS`/`FAIL`, destroys it. No agent, no OpenAI calls (`OPENAI_API_KEY` not needed), no viewer. |
 
 Main `SuperserveSandbox` options (all optional):
 
@@ -167,9 +171,13 @@ await sandbox.destroy();
 ## OpenAI computer-use agent
 
 `examples/agent.ts` runs a Mastra agent on an OpenAI model against one VM.
-The agent takes a screenshot, opens a terminal through the desktop, types
-a command that writes a unique token to `/tmp/mastra-agent-demo.txt`, and
-checks the file. The script then verifies the result independently.
+The agent takes a screenshot, opens a GUI text editor through the desktop,
+types a short document with a unique token, and saves it as
+`/home/desktop/mastra-superserve-demo.txt`. The script then reads the file back
+independently. Superserve's `superserve/desktop` template documents no text
+editor, so before any model call a read-only check looks for one (Mousepad
+first); if none is installed the run stops with `FAIL` and no OpenAI usage,
+unless `DEMO_SETUP_EDITOR=1` installs Mousepad first.
 
 ```bash
 cp .env.example .env   # set SUPERSERVE_API_KEY and OPENAI_API_KEY
