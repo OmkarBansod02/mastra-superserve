@@ -122,6 +122,8 @@ export interface PersistenceShowcaseOptions {
   /** File the agent saved and text it must contain (the verification token). */
   target: string;
   expected: string;
+  /** How the "State preserved" line names `expected`. Default: "the agent's token". */
+  expectedLabel?: string;
   /** Options for the new provider instance (`id` and `sandboxId` are set here). */
   sandboxOptions?: SuperserveSandboxOptions;
   /** Tool config for the new instance's workspace (tests shorten screenshot delays). */
@@ -181,7 +183,7 @@ export async function showcasePersistence(o: PersistenceShowcaseOptions): Promis
   if (after.exitCode !== 0 || !after.stdout.includes(expected)) {
     return fail('file check after reattach', `exit ${after.exitCode}`);
   }
-  log(`[VM] State preserved: ${target} still holds the agent's token`);
+  log(`[VM] State preserved: ${target} still holds ${o.expectedLabel ?? "the agent's token"}`);
 
   const shot = await restored.sandbox.computer.screenshot();
   const size = await restored.sandbox.computer.getScreenSize();

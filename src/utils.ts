@@ -206,7 +206,7 @@ export function pngSize(buf: Uint8Array): { width: number; height: number } | nu
 // xdotool
 // ---------------------------------------------------------------------------
 
-/** Command used for the cursor query (verified live in Phase 1, tests B1/B2/D4). */
+/** Command used for the cursor query (verified on `superserve/desktop`). */
 export const CURSOR_QUERY_COMMAND = 'xdotool getmouselocation --shell';
 
 /**
@@ -244,7 +244,7 @@ export const WRITE_EXIT = {
  * A POSIX `sh` script, run as the sandbox's command user, that reads a file's
  * bytes from stdin and installs them at `dest`.
  *
- * Phase 4A found that Superserve's files API writes as root (root-owned files
+ * Superserve's files API writes as root (root-owned files
  * and parent dirs the desktop user can't edit, rename or delete). Running the
  * write as an ordinary command fixes ownership. To keep it safe:
  * - bytes go to a fresh temp file in the destination directory (`set -C`, so

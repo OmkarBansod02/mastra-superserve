@@ -64,11 +64,11 @@ import {
 /** Metadata key tagging a VM with the logical Mastra sandbox id that created it. */
 export const SANDBOX_ID_METADATA_KEY = 'mastra-sandbox-id';
 export const DEFAULT_TEMPLATE = 'superserve/desktop';
-/** Auto-pause after 15 minutes active (Phase 1 safeguard). */
+/** Auto-pause after 15 minutes active (safety net against leaked VMs). */
 export const DEFAULT_TIMEOUT_SECONDS = 900;
-/** Auto-delete after 10 minutes continuously paused (Phase 1 safeguard). */
+/** Auto-delete after 10 minutes continuously paused (safety net against leaked VMs). */
 export const DEFAULT_AUTO_DELETE_SECONDS = 600;
-/** X display of the `superserve/desktop` template (Phase 1). */
+/** X display of the `superserve/desktop` template. */
 export const DEFAULT_DISPLAY = ':1';
 const DEFAULT_COMMAND_TIMEOUT_MS = 60_000;
 /**
@@ -80,7 +80,7 @@ const DEFAULT_CURSOR_QUERY_TIMEOUT_MS = 10_000;
 /** How long past the server-side timeout a file write waits for its exit report. */
 const WRITE_CLIENT_GRACE_MS = 5_000;
 const DEFAULT_PAUSE_TIMEOUT_MS = 120_000;
-/** Superserve rejects VM names outside 1–64 characters (found live in Phase 3). */
+/** Superserve rejects VM names outside 1–64 characters (observed against the live API). */
 const MAX_VM_NAME_LENGTH = 64;
 
 /** Every non-terminal VM status — the ones a sandbox can be reattached from. */
@@ -766,7 +766,7 @@ export class SuperserveSandbox extends MastraSandbox<AttachTarget> {
 
   /**
    * Real cursor position via `xdotool getmouselocation --shell` inside the VM
-   * (verified live in Phase 1). Fails loudly rather than guessing.
+   * (verified on `superserve/desktop`). Fails loudly rather than guessing.
    */
   private async queryCursor(): Promise<ComputerPosition> {
     const result = await this.withLive(

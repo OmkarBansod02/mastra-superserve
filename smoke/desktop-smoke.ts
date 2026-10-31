@@ -1,4 +1,5 @@
-// Phase 1 live smoke test: one superserve/desktop sandbox, always destroyed in finally.
+// Live smoke test of the raw @superserve/sdk desktop API (no Mastra): one
+// superserve/desktop sandbox, always destroyed in finally.
 // The SDK reads SUPERSERVE_API_KEY from the environment; this script never touches it.
 import { Sandbox } from "@superserve/sdk";
 import { mkdirSync, writeFileSync, rmSync } from "node:fs";

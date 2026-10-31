@@ -1,78 +1,63 @@
 # mastra-superserve
 
-A [Mastra](https://mastra.ai) workspace sandbox provider backed by
+A [Mastra](https://mastra.ai) sandbox provider that runs agents on
 [Superserve](https://superserve.ai) cloud desktop VMs.
 
-`SuperserveSandbox` gives a Mastra `Workspace` a Linux desktop running in a
-Superserve VM. Agents that use the workspace get shell commands, file writes and
-Mastra's built-in computer-use tools (screenshot, mouse, keyboard), with no
-hand-written tools.
+Attach a `SuperserveSandbox` to a Mastra `Workspace` and your agent can run
+shell commands, write files, and operate a Linux desktop through Mastra's
+built-in computer-use tools (screenshot, mouse, keyboard). You don't write any
+tools yourself.
 
-> **Unofficial.** This is a community integration. It is not built, endorsed or
-> supported by Superserve or Mastra. It is not published to npm yet.
+> **Unofficial community integration.** Not built, endorsed or supported by
+> Mastra or Superserve. Not published to npm.
 
-## Why use it
-
-- Give a Mastra agent a real graphical desktop to operate, not only a shell.
-- Use Mastra's standard workspace tools; the agent code does not change if you
-  swap sandbox providers.
-- Keep VM lifetime under control: VMs are created lazily, auto-pause and
-  auto-delete by default, and are only killed by the instance that owns them.
-- Pause a VM and reattach to it later, with memory, disk and processes intact.
-
-## Features
-
-| Area | Supported |
-| --- | --- |
-| Shell | `executeCommand` with cwd, env, timeout, abort signal, streaming stdout/stderr |
-| Files | `writeFiles` as the desktop user (atomic, checksummed, parent dirs created) |
-| Computer use | screenshot (PNG), left/right/double click, move, drag, scroll, type, key press, screen size, cursor position |
-| Live view | `computer.streamUrl()` returns a noVNC viewer URL (private by default, can be disabled) |
-| Lifecycle | lazy start, `stop()` = pause, `destroy()` = kill when owned |
-| Persistence | reattach by Superserve VM id (`sandboxId`) or by logical Mastra id (`id`) |
-| Errors | Superserve SDK errors mapped to Mastra `SandboxError` types |
-
-When the sandbox is attached to a `Workspace`, Mastra injects these tools into
-the agent: `mastra_workspace_execute_command` and
-`mastra_workspace_computer_{screenshot, click, double_click, right_click,
-move_mouse, drag, scroll, type, press_key, get_screen_info, wait}`.
-
-## Architecture
+## How it fits together
 
 ```
 Mastra Agent
-   │  tool calls (mastra_workspace_computer_*, execute_command)
+   │  mastra_workspace_computer_* and mastra_workspace_execute_command tool calls
    ▼
-Mastra Workspace  ──►  SuperserveSandbox  (this package, extends MastraSandbox)
-                          │  @superserve/sdk
-                          ▼
-                     Superserve API  ──►  Firecracker microVM
-                                           (superserve/desktop template, X display :1)
+Mastra Workspace
+   ▼
+SuperserveSandbox            (this package: extends MastraSandbox, implements SandboxComputer)
+   │  Superserve SDK (@superserve/sdk)
+   ▼
+Superserve VM                (superserve/desktop template: Ubuntu + XFCE, X display :1)
 ```
 
-- `src/sandbox.ts`: the provider. Lifecycle (find → connect, else create),
-  commands, file writes, the `computer` capability and error mapping.
-- `src/utils.ts`: key-name normalisation, argument validation, PNG size
-  parsing, and the in-VM file-write script.
-- Two ids are kept separate: `id` is the logical Mastra sandbox id (stored in
-  VM metadata as `mastra-sandbox-id`); `sandboxId` is the physical Superserve
-  VM UUID.
-- Ownership decides what `destroy()` does: `created` and `adopted` VMs are
-  killed; `borrowed` VMs (untagged VMs created outside Mastra) are only
-  detached. Override with `killOnDestroy`.
+Mastra defines the sandbox interface (`MastraSandbox`) and the computer-use
+interface (`SandboxComputer`). When a `Workspace` has a sandbox with a
+`computer`, Mastra gives the agent these tools:
+`mastra_workspace_execute_command` and
+`mastra_workspace_computer_{screenshot, click, double_click, right_click, move_mouse, drag, scroll, type, press_key, get_screen_info, wait}`.
+
+`SuperserveSandbox` implements both interfaces on top of the Superserve SDK,
+so those tool calls become Superserve API calls against one VM.
+
+## What the provider implements
+
+| Area | Behaviour |
+| --- | --- |
+| Lifecycle | VM created lazily on first use. `stop()` pauses it, `destroy()` kills it if this instance owns it. |
+| Reconnect | Reattach to a VM by Superserve VM id (`sandboxId`) or by a stable logical Mastra id (`id`). |
+| Commands | `executeCommand` with cwd, env, timeout, abort signal and streamed stdout/stderr. |
+| Files | `writeFiles` as the desktop user: parent dirs created, checksummed, atomic rename. |
+| Computer use | Screenshot (PNG), left/right/double click, move, drag, scroll, type, key press, screen size, cursor position. |
+| Live view | `computer.streamUrl()` returns a noVNC viewer URL (private by default; can be disabled). |
+| Safety | New VMs auto-pause after 15 min active and auto-delete after 10 min paused (both configurable). |
+| Errors | Superserve SDK errors are mapped to Mastra `SandboxError` types. |
+
+`stop()` and reconnect keep the VM's memory, disk and running processes,
+because Superserve pauses and resumes the same VM.
 
 ## Requirements
 
-- Node.js **22.13 or later** (matches `@mastra/core`'s `engines`). CI runs on
-  Node 22 and 24.
-- pnpm 9 (the repo pins `pnpm@9.15.4` via `packageManager`; `corepack enable`
-  picks it up).
-- `@mastra/core` `>=1.80.0 <2` as a peer dependency. Developed and tested
-  against 1.80.0.
-- A Superserve API key for anything that starts a VM.
-- An OpenAI API key only for the OpenAI agent example.
+- Node.js 22.13 or later (CI runs Node 22 and 24)
+- pnpm 9 (`corepack enable` picks up the pinned version)
+- `@mastra/core` `>=1.80.0 <2` as a peer dependency (developed against 1.80.0)
+- A Superserve API key. An OpenAI API key is needed only for the agent examples.
 
-## Installation
+## Install
 
 The package is not on npm. Build it from source:
 
@@ -84,51 +69,13 @@ pnpm install --frozen-lockfile
 pnpm build
 ```
 
-To use it from another project, install the local checkout next to Mastra:
+To use it from another project:
 
 ```bash
-pnpm add /path/to/mastra-superserve @mastra/core
+pnpm add /path/to/mastra-superserve @mastra/core zod
 ```
 
-The package is ESM-only and exports `SuperserveSandbox`, its option and
-ownership types, `normalizeKey`, and the defaults (`DEFAULT_TEMPLATE`,
-`DEFAULT_TIMEOUT_SECONDS`, `DEFAULT_AUTO_DELETE_SECONDS`, `DEFAULT_DISPLAY`,
-`SANDBOX_ID_METADATA_KEY`).
-
-## Configuration
-
-Copy `.env.example` to `.env` and fill it in. `.env` is git-ignored.
-
-| Variable | Used by | Notes |
-| --- | --- | --- |
-| `SUPERSERVE_API_KEY` | provider, examples, smoke tests | Required to create or attach VMs. Can also be passed as the `apiKey` option. |
-| `SUPERSERVE_BASE_URL` | provider | Optional API endpoint override (`baseUrl` option). |
-| `OPENAI_API_KEY` | `example:agent` | Required only for the OpenAI agent. |
-| `OPENAI_MODEL` | `example:agent` | Default `gpt-5.4-mini`. Must support tool calls and image input. |
-| `MAX_STEPS` | `example:agent` | Agent step budget, 1–15. Default 10. |
-| `DEBUG_IMAGES` | `example:agent` | `1` to log screenshots sent to OpenAI (ids and sizes only). |
-| `DEMO_MODE` | `example:agent` | `1` for recording mode: live `[AGENT]` tool-call logs and a scripted pause/reattach showcase. See `docs/DEMO.md`. |
-| `DEMO_VIEWER`, `DEMO_VIEWER_PORT` | `example:agent` | With `DEMO_MODE`, `1` serves `http://localhost:7777/` as a redirect to a private, view-only desktop viewer. |
-| `DEMO_SETUP_EDITOR` | `example:agent` | `1` installs Mousepad (apt-get, passwordless sudo) before the agent runs when the VM has no GUI text editor. Logged as `[SETUP]`; fails before any model call if unsupported. |
-| `DEMO_CONTINUE`, `DEMO_CONTINUE_MAX_STEPS` | `example:agent` | With `DEMO_MODE`, `1` keeps the VM after the reattach and runs a second, independent agent invocation (Session 2, default 15 steps, max 20) on the reconnected instance that appends to the same document through the GUI; both sessions' tokens are verified before the VM is destroyed. See `docs/DEMO.md`. |
-| `DEMO_SETUP_ONLY` | `example:agent` | `1` only checks the Mousepad install on one VM: creates it, installs and verifies Mousepad, prints `[SETUP] PASS`/`FAIL`, destroys it. No agent, no OpenAI calls (`OPENAI_API_KEY` not needed), no viewer. |
-
-Main `SuperserveSandbox` options (all optional):
-
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `id` | random | Logical Mastra id. When set, `start()` first resumes a VM tagged with it. |
-| `sandboxId` | — | Superserve VM UUID to reattach to. |
-| `reattach` | `'required'` | If `sandboxId` is gone: `'required'` throws, `'best-effort'` falls back to lookup/create. |
-| `killOnDestroy` | `'owned'` | `'owned'`, `'always'` or `'never'`. |
-| `template` | `'superserve/desktop'` | VM template. |
-| `timeoutSeconds` | `900` | Auto-pause after this long active. Cannot be disabled. |
-| `autoDeleteSeconds` | `600` | Auto-delete after this long paused. `null` keeps paused VMs. |
-| `liveView` | `'private'` | Viewer access: `'private'`, `'public'` or `false`. `'public'` lets anyone with the URL control the desktop. |
-| `commandTimeoutMs` | `60000` | Default command timeout. |
-| `metadata`, `namePrefix`, `display`, `apiKey`, `baseUrl` | | See the JSDoc in `src/sandbox.ts`. |
-
-## Minimal Mastra example
+## Usage
 
 ```ts
 import { Agent } from '@mastra/core/agent';
@@ -143,7 +90,7 @@ const agent = new Agent({
   name: 'Desktop agent',
   instructions: 'You operate a Linux desktop through the computer tools. Take a screenshot before acting.',
   model: 'openai/gpt-5.4-mini',
-  workspace, // adds the computer and execute_command tools
+  workspace,
 });
 
 try {
@@ -154,112 +101,157 @@ try {
 }
 ```
 
-No VM is created until the first tool call (or an explicit `start()`).
-
 The sandbox can also be used directly:
 
 ```ts
 await sandbox.start();
-const { stdout } = await sandbox.executeCommand('uname', ['-a']);
+await sandbox.executeCommand('uname', ['-a']);
 await sandbox.writeFiles([{ path: '/home/desktop/notes.txt', content: 'hello' }]);
-const shot = await sandbox.computer.screenshot(); // { data: Uint8Array, mediaType: 'image/png' }
+await sandbox.computer.screenshot(); // { data: Uint8Array, mediaType: 'image/png' }
 await sandbox.computer.leftClick(100, 200);
 await sandbox.computer.type('hello');
 await sandbox.computer.press('Enter');
 await sandbox.destroy();
 ```
 
-## OpenAI computer-use agent
-
-`examples/agent.ts` runs a Mastra agent on an OpenAI model against one VM.
-The agent takes a screenshot, opens a GUI text editor through the desktop,
-types a short document with a unique token, and saves it as
-`/home/desktop/mastra-superserve-demo.txt`. The script then reads the file back
-independently. Superserve's `superserve/desktop` template documents no text
-editor, so before any model call a read-only check looks for one (Mousepad
-first); if none is installed the run stops with `FAIL` and no OpenAI usage,
-unless `DEMO_SETUP_EDITOR=1` installs Mousepad first.
-
-```bash
-cp .env.example .env   # set SUPERSERVE_API_KEY and OPENAI_API_KEY
-pnpm example:agent
-```
-
-- Creates one VM and destroys it on success, failure, Ctrl-C or watchdog
-  timeout. If cleanup fails, it prints the VM id to delete manually.
-- Bounded: at most `MAX_STEPS` (≤ 15) model steps, a 5-minute run limit, and
-  a VM auto-pause after 10 minutes.
-- Exits 0 with `PASS` when every check passes, 1 with `FAIL` and the failed
-  checks otherwise. Without both keys it prints `Skipping` and exits 0.
-- Never prints API keys or live-viewer URLs.
-
-This uses paid OpenAI and Superserve resources. See
-[docs/DEMO.md](docs/DEMO.md) for a recording checklist.
-
-## Persistence and reconnect
-
-`stop()` pauses the VM; memory, disk and running processes are kept. Persist
-`sandbox.sandboxId` and pass it back later to reattach:
+### Pause and reconnect
 
 ```ts
 const first = new SuperserveSandbox({ autoDeleteSeconds: 3600 });
 await first.start();
-await first.executeCommand('echo state > /tmp/state.txt');
-const vmId = first.sandboxId!; // store this
-await first.stop(); // pause; auto-delete starts counting
+const vmId = first.sandboxId!; // persist this
+await first.stop();            // pause
 
 // Later, possibly in another process:
 const again = new SuperserveSandbox({ sandboxId: vmId });
-await again.start(); // resumes the same VM
-console.log((await again.executeCommand('cat /tmp/state.txt')).stdout); // "state"
-await again.destroy(); // kills it (it was created by a Mastra sandbox)
+await again.start();           // resumes the same VM
+await again.destroy();
 ```
 
-Alternatively give the sandbox a stable logical `id`
-(`new SuperserveSandbox({ id: 'user-42-desktop' })`); `start()` resumes a VM
-tagged with that id, or creates one.
+Or pass a stable logical id (`new SuperserveSandbox({ id: 'user-42-desktop' })`):
+`start()` resumes the VM tagged with that id, or creates one.
 
-A paused VM is deleted after `autoDeleteSeconds` (600 by default). Reattaching
-to a deleted VM throws (`reattach: 'required'`) or creates a new VM
-(`reattach: 'best-effort'`).
+### Options
 
-## Testing
+All optional.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `id` | random | Logical Mastra id. When set, `start()` first resumes a VM tagged with it. |
+| `sandboxId` | — | Superserve VM id to reattach to. |
+| `reattach` | `'required'` | If `sandboxId` no longer exists: `'required'` throws, `'best-effort'` falls back to lookup/create. |
+| `killOnDestroy` | `'owned'` | `'owned'` kills VMs this provider created or tagged; `'always'`; `'never'`. |
+| `template` | `'superserve/desktop'` | VM template. Only this one has been tested. |
+| `timeoutSeconds` | `900` | Auto-pause after this long active. Cannot be disabled. |
+| `autoDeleteSeconds` | `600` | Auto-delete after this long paused. `null` keeps paused VMs. |
+| `liveView` | `'private'` | Viewer access: `'private'`, `'public'` or `false`. `'public'` lets anyone with the URL control the desktop. |
+| `commandTimeoutMs` | `60000` | Default command timeout. |
+| `metadata`, `namePrefix`, `display`, `apiKey`, `baseUrl` | | See the JSDoc in `src/sandbox.ts`. |
+
+## Examples
+
+Both examples run a Mastra agent on an OpenAI model against one real
+Superserve VM. They cost OpenAI and Superserve usage, cap model steps and wall
+time, always destroy the VM at the end (including on failure and Ctrl-C), and
+never print API keys or viewer URLs. Without the required keys they print
+`Skipping` and exit 0.
+
+```bash
+cp .env.example .env   # set SUPERSERVE_API_KEY and OPENAI_API_KEY
+```
+
+The `superserve/desktop` template ships no GUI text editor. Set
+`DEMO_SETUP_EDITOR=1` to have the script (not the agent) install Mousepad
+before the agent starts.
+
+### Two-session demo
+
+Two separate Mastra agents work on the same document, on the same VM, with a
+pause and reconnect between them:
+
+1. **Session 1.** An agent opens Mousepad through the desktop menu, types a
+   document and saves it. Every click and keystroke is a tool call chosen by
+   the model; no coordinates are given.
+2. **Pause and reconnect.** The script pauses the VM, creates a new
+   `SuperserveSandbox` from the saved `sandboxId` and reconnects to the same VM.
+3. **Session 2.** A new agent with no memory of Session 1 continues the
+   document through the GUI. Only the VM's state carries over.
+4. **Verification.** The script reads the file itself with a read-only `cat`
+   and checks the content, that the same VM was used throughout, and that the
+   agents used the GUI rather than shell writes. Then it destroys the VM.
+
+Two variants:
+
+```bash
+# Launch brief: Session 1 drafts a budget brief, Session 2 reads it and adds the total.
+DEMO_SETUP_EDITOR=1 pnpm example:launch
+
+# Fallback: a shorter Mousepad document with a verification token per session.
+DEMO_MODE=1 DEMO_CONTINUE=1 DEMO_SETUP_EDITOR=1 MAX_STEPS=15 pnpm example:agent
+```
+
+Add `DEMO_VIEWER=1` to watch the desktop live at `http://localhost:7777/`
+(a local redirect to a private, view-only viewer). Details:
+[docs/LAUNCH-DEMO.md](docs/LAUNCH-DEMO.md) and [docs/DEMO.md](docs/DEMO.md).
+
+## Environment variables
+
+| Variable | Used by | Notes |
+| --- | --- | --- |
+| `SUPERSERVE_API_KEY` | provider, examples, smoke tests | Required to create or attach VMs. Can also be passed as `apiKey`. |
+| `SUPERSERVE_BASE_URL` | provider | Optional API endpoint override (`baseUrl`). |
+| `OPENAI_API_KEY` | examples | Required for the agent examples. |
+| `OPENAI_MODEL` | examples | Default `gpt-5.4-mini`. Needs tool calls and image input. |
+| `DEMO_SETUP_EDITOR` | examples | `1` installs Mousepad if no GUI editor is found. |
+| `DEMO_VIEWER`, `DEMO_VIEWER_PORT` | examples | `1` serves a local redirect to a view-only viewer (port 7777). `example:agent` needs `DEMO_MODE=1`. |
+| `LAUNCH_S1_MAX_STEPS`, `LAUNCH_S2_MAX_STEPS` | `example:launch` | Step budgets per session (default 38 / 30, max 40). |
+| `LAUNCH_EDITOR_LOOK` | `example:launch` | `0` skips the larger editor font and maximized window. |
+| `MAX_STEPS` | `example:agent` | Session 1 step budget, 1–15 (default 10). |
+| `DEMO_MODE`, `DEMO_CONTINUE`, `DEMO_CONTINUE_MAX_STEPS` | `example:agent` | Enable the pause/reconnect showcase and Session 2 (default 15 steps, max 20). |
+| `DEMO_SETUP_ONLY` | `example:agent` | `1` only installs and verifies Mousepad on one VM. No agent, no OpenAI calls. |
+| `DEBUG_IMAGES` | `example:agent` | `1` logs screenshot ids and sizes sent to the model. |
+
+## Tests
 
 ```bash
 pnpm typecheck
-pnpm test        # unit tests: fakes only, network access blocked, no keys needed
+pnpm test       # unit tests against fakes; network blocked, no keys needed
 pnpm build
 ```
 
-Live checks create real VMs and need `SUPERSERVE_API_KEY`. They are never run
-in CI. Each one cleans up its VM.
+CI runs these on Node 22 and 24. The unit tests cover the provider and both
+demos end to end, using a fake Superserve SDK and a scripted stand-in for the
+model.
+
+Live checks create real VMs, need `SUPERSERVE_API_KEY`, and are never run in
+CI:
 
 ```bash
-pnpm smoke           # smoke/phase1.ts: raw SDK desktop smoke test
-pnpm e2e             # examples/workspace-e2e.ts: provider inside a Mastra Workspace
-pnpm example:agent   # also needs OPENAI_API_KEY
+pnpm smoke   # raw Superserve SDK desktop smoke test
+pnpm e2e     # SuperserveSandbox inside a Mastra Workspace, driven through Mastra's tools
 ```
 
 Live runs write screenshots and results to `artifacts/` (git-ignored).
 
-## Known limitations
+## Limitations
 
 - Not published to npm; install from source.
 - Only the `superserve/desktop` template has been tested.
-- Background process management (`processes`) is not implemented; use
+- Only OpenAI models have been tried with the agent examples.
+- Background processes (`MastraSandbox` `processes`) are not implemented; use
   `executeCommand`.
-- `writeFiles` writes as the desktop user: paths that user cannot write fail
-  with `WRITE_FAILED`. Per-file `mode` is rejected.
+- `writeFiles` writes as the desktop user, so paths that user cannot write
+  fail with `WRITE_FAILED`. Per-file `mode` is rejected.
 - `executeCommand` always has a timeout (Superserve has no unbounded commands).
   When output exceeds Superserve's cap, both streams are flagged truncated.
 - `getCursorPosition` needs `xdotool` in the template.
 - Auto-pause cannot be disabled; long-running agents must tolerate a resume.
-- Only OpenAI models have been tried with the agent example.
+- The launch demo's display settings (editor font, maximized window) are
+  best-effort and have not been confirmed on a live VM.
 
 ## License
 
-[Apache-2.0](LICENSE). Dependencies `@mastra/core` and `@superserve/sdk` are
-Apache-2.0 as well (`@mastra/core`'s `ee/` directories are under a separate
-license and are not used here).
+[Apache-2.0](LICENSE). `@mastra/core` and `@superserve/sdk` are also
+Apache-2.0.
 
 Mastra and Superserve are trademarks of their respective owners.

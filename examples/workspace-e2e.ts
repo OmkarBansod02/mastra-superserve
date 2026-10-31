@@ -1,5 +1,5 @@
 /**
- * Phase 3 live integration: SuperserveSandbox inside a real Mastra Workspace,
+ * Live integration check: SuperserveSandbox inside a real Mastra Workspace,
  * driven only through Mastra's workspace tools (and a Mastra Agent), against
  * ONE real Superserve desktop VM that is always cleaned up.
  *
@@ -91,7 +91,7 @@ async function sh(tools: Tools, command: string, timeout = 30): Promise<string> 
 
 // ---------------------------------------------------------------------------
 // In-VM X11 event recorder (python3 + libX11 via ctypes; both present in
-// superserve/desktop per Phase 1 test B2). Logs ButtonPress/Release/Motion
+// superserve/desktop). Logs ButtonPress/Release/Motion
 // with root coordinates as JSON lines. Receives input only; never acts.
 // ---------------------------------------------------------------------------
 

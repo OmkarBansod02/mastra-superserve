@@ -44,9 +44,10 @@
     "build": "pnpm clean && tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
-    "smoke": "tsx --env-file-if-exists=.env smoke/phase1.ts",
+    "smoke": "tsx --env-file-if-exists=.env smoke/desktop-smoke.ts",
     "e2e": "tsx --env-file-if-exists=.env examples/workspace-e2e.ts",
     "example:agent": "tsx --env-file-if-exists=.env examples/agent.ts",
+    "example:launch": "tsx --env-file-if-exists=.env examples/launch-demo.ts",
     "prepack": "pnpm build"
   },
   "dependencies": {
