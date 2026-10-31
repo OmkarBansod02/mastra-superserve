@@ -110,6 +110,7 @@ Copy `.env.example` to `.env` and fill it in. `.env` is git-ignored.
 | `DEMO_MODE` | `example:agent` | `1` for recording mode: live `[AGENT]` tool-call logs and a scripted pause/reattach showcase. See `docs/DEMO.md`. |
 | `DEMO_VIEWER`, `DEMO_VIEWER_PORT` | `example:agent` | With `DEMO_MODE`, `1` serves `http://localhost:7777/` as a redirect to a private, view-only desktop viewer. |
 | `DEMO_SETUP_EDITOR` | `example:agent` | `1` installs Mousepad (apt-get, passwordless sudo) before the agent runs when the VM has no GUI text editor. Logged as `[SETUP]`; fails before any model call if unsupported. |
+| `DEMO_CONTINUE`, `DEMO_CONTINUE_MAX_STEPS` | `example:agent` | With `DEMO_MODE`, `1` keeps the VM after the reattach and runs a second, independent agent invocation (Session 2, default 15 steps, max 20) on the reconnected instance that appends to the same document through the GUI; both sessions' tokens are verified before the VM is destroyed. See `docs/DEMO.md`. |
 | `DEMO_SETUP_ONLY` | `example:agent` | `1` only checks the Mousepad install on one VM: creates it, installs and verifies Mousepad, prints `[SETUP] PASS`/`FAIL`, destroys it. No agent, no OpenAI calls (`OPENAI_API_KEY` not needed), no viewer. |
 
 Main `SuperserveSandbox` options (all optional):

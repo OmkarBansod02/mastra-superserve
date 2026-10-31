@@ -17,7 +17,7 @@
  */
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import type { Workspace } from '@mastra/core/workspace';
+import type { Workspace, WorkspaceToolsConfig } from '@mastra/core/workspace';
 import { DESKTOP_STREAM_PORT, Sandbox as SdkSandbox } from '@superserve/sdk';
 import { SANDBOX_ID_METADATA_KEY, SuperserveSandbox, type SuperserveSandboxOptions } from '../src/index.js';
 import { createDesktopWorkspace } from './desktop-agent.js';
@@ -124,6 +124,8 @@ export interface PersistenceShowcaseOptions {
   expected: string;
   /** Options for the new provider instance (`id` and `sandboxId` are set here). */
   sandboxOptions?: SuperserveSandboxOptions;
+  /** Tool config for the new instance's workspace (tests shorten screenshot delays). */
+  tools?: WorkspaceToolsConfig;
   /**
    * Called as soon as the new instance exists, before it attaches, so the
    * caller's cleanup can destroy it whatever happens next.
@@ -165,7 +167,7 @@ export async function showcasePersistence(o: PersistenceShowcaseOptions): Promis
   log(`[VM] Paused (Superserve reports: ${paused})`);
 
   // Only what an app would persist: the VM id and the logical id that owns it.
-  const restored = createDesktopWorkspace({ ...o.sandboxOptions, id: logicalId, sandboxId: savedId });
+  const restored = createDesktopWorkspace({ ...o.sandboxOptions, id: logicalId, sandboxId: savedId }, o.tools);
   o.onRestored(restored);
   log(`[VM] New provider instance created from saved sandboxId ${shortId(savedId)}`);
 

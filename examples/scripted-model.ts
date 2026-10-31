@@ -17,7 +17,11 @@ type StreamPart = StreamResult['stream'] extends ReadableStream<infer P> ? P : n
 
 const usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
 
-export function scriptedModel(steps: ScriptedStep[]) {
+/**
+ * `onPrompt` receives the prompt Mastra sends on each model call (tests use it
+ * to check what context a model invocation was given).
+ */
+export function scriptedModel(steps: ScriptedStep[], opts: { onPrompt?: (prompt: unknown) => void } = {}) {
   let index = 0;
   const next = () => {
     const n = index++;
@@ -39,11 +43,13 @@ export function scriptedModel(steps: ScriptedStep[]) {
   return new MastraLanguageModelV2Mock({
     provider: 'scripted',
     modelId: 'scripted-desktop-model',
-    doGenerate: async () => {
+    doGenerate: async (options) => {
+      opts.onPrompt?.(options.prompt);
       const { content, finishReason } = next();
       return { content, finishReason, usage, warnings: [] } as GenerateResult;
     },
-    doStream: async () => {
+    doStream: async (options) => {
+      opts.onPrompt?.(options.prompt);
       const { n, content, finishReason } = next();
       const parts: StreamPart[] = [{ type: 'stream-start', warnings: [] }];
       for (const c of content) {

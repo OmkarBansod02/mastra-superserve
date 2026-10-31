@@ -91,6 +91,79 @@ the editor but gives no coordinates; every click and key is the model's.
 - Two screenshots are saved to `artifacts/` (git-ignored):
   `demo-1-after-agent.png` and `demo-2-after-reconnect.png`.
 
+## Two sessions on one VM (`DEMO_CONTINUE=1`)
+
+With `DEMO_MODE=1 DEMO_CONTINUE=1`, the run keeps the VM after the reattach
+and starts a second Mastra agent invocation on it. Without the flag nothing
+changes.
+
+```
+=== Session 1: first Mastra agent invocation ===
+[AGENT S1] computer_screenshot
+...                                   the editor task above, unchanged
+PASS: the agent completed the desktop task
+--- persistence showcase (scripted lifecycle, not agent actions) ---
+[VM] Screenshot saved: artifacts/demo-1-after-agent.png
+[VM] File verified / Paused / New provider instance / Reconnected (ownership: adopted)
+[VM] State preserved: … still holds the agent's token
+[VM] Screenshot saved: artifacts/demo-2-after-reconnect.png
+[VM] No replacement VM: Superserve lists exactly one VM for this sandbox (1a2b3c4d); keeping it for Session 2
+=== Session 2: new Mastra agent invocation on the reconnected VM ===
+[SESSION 2] New Agent bound to the reconnected SuperserveSandbox (1a2b3c4d). It gets no messages, reasoning or memory from Session 1; only the VM (files and desktop) carried over.
+[AGENT S2] computer_screenshot
+[AGENT S2] computer_click (…)         the editor's text area
+[AGENT S2] computer_press_key ctrl+End
+[AGENT S2] computer_press_key Enter
+[AGENT S2] computer_type (36 chars)   Session 2: Continued after reconnect
+[AGENT S2] computer_press_key Enter
+[AGENT S2] computer_type (…)          Session 2 token: …
+[AGENT S2] computer_press_key ctrl+s
+[AGENT S2] execute_command            cat (read-only check)
+[SESSION 2] steps / usage / agent answer
+[VM] Screenshot saved: artifacts/demo-3-after-session-2.png
+  [ok] same sandboxId for Session 1, reconnect and Session 2 (1a2b3c4d)
+  [ok] …                              GUI use, no shell edits, both tokens
+[SESSION 2] PASS: the second agent continued the document on the same VM
+[VM] Destroyed (sandbox 1a2b3c4d no longer listed by Superserve)
+[RESULT] PASS
+```
+
+- **What persists.** Only the VM: its disk, and the desktop session if the
+  pause kept it. Session 2 is a new `Agent` with no memory configured, bound
+  to the reconnected instance's `Workspace`. Its prompt holds only the file
+  path, the heading and a new token: not Session 1's token, prompt, tool
+  calls or answer. The model has no recollection of Session 1.
+- **The task.** If a Mousepad window with the file survived the pause, the
+  model may use it; otherwise it opens Mousepad through the Applications
+  menu and the file with ctrl+o. It clicks the text area, presses ctrl+End,
+  types `Session 2: Continued after reconnect` and
+  `Session 2 token: <new token>` on new lines, and saves with ctrl+s. No
+  coordinates are given.
+- **Checks (all must pass):** same `sandboxId` before the pause, after the
+  reconnect and after Session 2, with exactly one VM listed for the logical
+  id; Session 2 took a screenshot, clicked, used the key tool and typed the
+  heading and its token with the keyboard tool; no shell command launched
+  the editor, wrote or edited the file (redirects, `tee`, `sed -i`,
+  `cp`/`mv`/`rm`, scripting tools), or sent desktop input (`xdotool type`);
+  a read-only `cat` outside the agent finds the title and Session 1 token,
+  the heading and Session 2 token, with the new section after Session 1's
+  content; the agent reported its token.
+- **Limits.** Session 2 has its own step budget (`DEMO_CONTINUE_MAX_STEPS`,
+  default 15, max 20) and the same 5-minute time limit as Session 1. The
+  watchdog grows by 6 minutes. Expect roughly twice the model usage of a
+  single-session run.
+- **Cleanup.** The reconnected instance is registered for cleanup before it
+  attaches, so the VM is destroyed (and its deletion confirmed) on success,
+  a failed check, a model error, a timeout, Ctrl-C or the watchdog. A failure
+  in Phase 2 stops the run before any Session 2 model call.
+
+```bash
+MAX_STEPS=15 DEMO_MODE=1 DEMO_CONTINUE=1 DEMO_SETUP_EDITOR=1 pnpm example:agent
+```
+
+Add `DEMO_VIEWER=1` to watch live; reload `http://localhost:7777/` after
+`[VM] Reconnected` to follow Session 2.
+
 ## Live viewer
 
 Superserve's docs describe no dashboard desktop viewer. The documented viewer

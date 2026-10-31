@@ -28,6 +28,12 @@
  *   logged as `[SETUP] …`. If that is unsupported or fails, the run stops
  *   with FAIL before any model call. The agent still opens the editor through
  *   the desktop.
+ * - DEMO_CONTINUE=1 (with DEMO_MODE): after the reattach, keep the VM and run a
+ *   second, independent agent invocation (Session 2) on the reconnected
+ *   instance that appends a section to the same document through the GUI,
+ *   then verify both sessions' tokens and destroy the VM (see
+ *   examples/continue-session.ts). DEMO_CONTINUE_MAX_STEPS: Session 2's step
+ *   budget, 1–20, default 15. Without the flag the run is unchanged.
  * - DEMO_SETUP_ONLY=1: only check the Mousepad setup on one VM (see
  *   examples/setup-only.ts): create it, install and verify Mousepad, print
  *   `[SETUP] PASS|FAIL`, destroy it. No agent, no OpenAI calls, no viewer;
@@ -51,6 +57,7 @@ import {
   type ViewerRedirect,
   waitForViewer,
 } from './demo.js';
+import { type ContinueConfig, continueConfig, runContinueDemo } from './continue-session.js';
 import { createDesktopAgent, createDesktopWorkspace, shellWritesTo } from './desktop-agent.js';
 import {
   checkDocument,
@@ -84,6 +91,15 @@ const DEMO_EXTRA_MS = 3 * 60_000 + (DEMO_VIEWER ? VIEWER_WAIT_MS : 0);
 /** Extra watchdog time for the optional editor install. */
 const SETUP_EXTRA_MS = DEMO_SETUP_EDITOR ? (EDITOR_SETUP_TIMEOUT_SECONDS + 60) * 1000 : 0;
 const SANDBOX_OPTIONS = { namePrefix: 'mastra-openai-agent', timeoutSeconds: VM_TIMEOUT_SECONDS };
+let CONTINUE: ContinueConfig;
+try {
+  CONTINUE = continueConfig(process.env);
+} catch (error) {
+  console.error((error as Error).message);
+  process.exit(1);
+}
+/** Extra watchdog time for Session 2 (its own agent time limit) and its checks. */
+const CONTINUE_EXTRA_MS = CONTINUE.enabled ? RUN_TIMEOUT_MS + 60_000 : 0;
 
 if (rawModel.includes('/') && !rawModel.startsWith('openai/')) {
   console.error(`OPENAI_MODEL must be an OpenAI model (e.g. gpt-5.4-mini), got ${JSON.stringify(rawModel)}.`);
@@ -193,7 +209,7 @@ process.once('beforeExit', () => {
 setTimeout(() => {
   console.error('Watchdog: run exceeded its time budget, exiting.');
   void destroy().finally(() => process.exit(1));
-}, RUN_TIMEOUT_MS + 120_000 + (DEMO_MODE ? DEMO_EXTRA_MS : 0) + SETUP_EXTRA_MS).unref();
+}, RUN_TIMEOUT_MS + 120_000 + (DEMO_MODE ? DEMO_EXTRA_MS : 0) + SETUP_EXTRA_MS + CONTINUE_EXTRA_MS).unref();
 
 type ToolChunk = { payload?: { toolName?: string; args?: unknown; result?: unknown; isError?: boolean } };
 
@@ -206,6 +222,9 @@ function saveShot(name: string, png: Uint8Array) {
 
 try {
   console.log(`model: ${MODEL}, max steps: ${MAX_STEPS}, time limit: ${RUN_TIMEOUT_MS / 60_000} min`);
+  if (CONTINUE.enabled) {
+    console.log(`DEMO_CONTINUE: Session 2 max steps: ${CONTINUE.maxSteps}, time limit: ${RUN_TIMEOUT_MS / 60_000} min`);
+  }
   if (DEMO_MODE) {
     // Demo mode shows VM creation as its own step; otherwise the first command starts the VM lazily.
     phase = 'VM start';
@@ -248,12 +267,15 @@ try {
     }
   }
   phase = 'agent run';
+  if (CONTINUE.enabled) console.log('=== Session 1: first Mastra agent invocation ===');
   const result = await agent.generate(
     editorTaskPrompt(editor, token, target),
     {
       maxSteps: MAX_STEPS,
       abortSignal: AbortSignal.timeout(RUN_TIMEOUT_MS),
-      ...(DEMO_MODE && { onChunk: createToolCallLogger((line) => console.log(line)) }),
+      ...(DEMO_MODE && {
+        onChunk: createToolCallLogger((line) => console.log(CONTINUE.enabled ? line.replace(/^\[AGENT\]/, '[AGENT S1]') : line)),
+      }),
     },
   );
 
@@ -316,16 +338,36 @@ try {
     console.log('--- persistence showcase (scripted lifecycle, not agent actions) ---');
     phase = 'persistence showcase';
     saveShot('demo-1-after-agent', (await sandbox.computer.screenshot()).data);
-    demoOk = await showcasePersistence({
-      sandbox,
-      workspace,
-      target,
-      expected: token,
-      sandboxOptions: SANDBOX_OPTIONS,
-      onRestored: (r) => (restored = r),
-      onScreenshot: (png) => saveShot('demo-2-after-reconnect', png),
-      log: (line) => console.log(line),
-    });
+    if (CONTINUE.enabled) {
+      // Phase 2 (pause/reattach, VM kept), Session 2 (a new agent invocation) and its checks.
+      demoOk = await runContinueDemo({
+        sandbox,
+        workspace,
+        target,
+        editor,
+        session1Token: token,
+        session2Token: `mastra-session2-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+        model: MODEL,
+        maxSteps: CONTINUE.maxSteps,
+        timeoutMs: RUN_TIMEOUT_MS,
+        sandboxOptions: SANDBOX_OPTIONS,
+        onRestored: (r) => (restored = r),
+        saveShot,
+        onPhase: (p) => (phase = p),
+        log: (line) => console.log(line),
+      });
+    } else {
+      demoOk = await showcasePersistence({
+        sandbox,
+        workspace,
+        target,
+        expected: token,
+        sandboxOptions: SANDBOX_OPTIONS,
+        onRestored: (r) => (restored = r),
+        onScreenshot: (png) => saveShot('demo-2-after-reconnect', png),
+        log: (line) => console.log(line),
+      });
+    }
     if (!demoOk) process.exitCode = 1;
   }
 } catch (error) {
